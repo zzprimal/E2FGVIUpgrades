@@ -1,10 +1,10 @@
 #!/bin/sh  
 
 # Choose one path to compress videos
-folder='./datasets/davis/JPEGImages'
+folder='./youtube-vos/JPEGImages/'
 # folder='./datasets/youtube-vos/JPEGImages'
 
-if  [ -f $folder ];then
+if  [ -d $folder ];then
     for file in $folder/*
     do
         if test -f $file
