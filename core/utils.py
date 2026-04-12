@@ -252,8 +252,8 @@ def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):
     ax.axis('off')  # removes the axis to leave only the shape
     fig.canvas.draw()
     # convert plt images into numpy images
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    data = data.reshape((fig.canvas.get_width_height()[::-1] + (3, )))
+    data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    data = data.reshape((fig.canvas.get_width_height()[::-1] + (4, )))
     plt.close(fig)
     # postprocess
     data = cv2.resize(data, (width, height))[:, :, 0]
