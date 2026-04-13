@@ -402,7 +402,7 @@ class Trainer:
 
     """
     def _train_epoch(self, pbar):
-        """Process input and calculate loss every training epoch"""
+        Process input and calculate loss every training epoch
         device = self.config['device']
 
         for frames, masks, _ in self.train_loader:
