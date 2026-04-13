@@ -289,7 +289,118 @@ class Trainer:
             if self.iteration > self.train_args['iterations']:
                 break
         print('\nEnd training....')
+    def _train_epoch(self, pbar):
+        device = self.config['device']
+        accum_steps = self.config['trainer'].get('accum_steps', 1)
+    
+        for frames, masks, _ in self.train_loader:
+            self.iteration += 1
+    
+            frames, masks = frames.to(device), masks.to(device)
+            l_t = self.num_local_frames
+            b, t, c, h, w = frames.size()
+    
+            masked_frames = (frames * (1 - masks).float())
+            gt_local_frames = (frames[:, :l_t, ...] + 1) / 2
+    
+            pred_imgs, pred_flows = self.netG(masked_frames, l_t)
+            pred_imgs = pred_imgs.view(b, -1, c, h, w)
+            comp_imgs = frames * (1. - masks) + masks * pred_imgs
+    
+            # ======================
+            # DISCRIMINATOR
+            # ======================
+            dis_loss = 0
+            if not self.config['model']['no_dis']:
+                real_clip = self.netD(frames)
+                fake_clip = self.netD(comp_imgs.detach())
+    
+                dis_real_loss = self.adversarial_loss(real_clip, True, True)
+                dis_fake_loss = self.adversarial_loss(fake_clip, False, True)
+    
+                dis_loss = (dis_real_loss + dis_fake_loss) / 2
+    
+                # 🔥 scale loss
+                dis_loss = dis_loss / accum_steps
+    
+                dis_loss.backward()
+    
+                # step only every accum_steps
+                if self.iteration % accum_steps == 0:
+                    self.optimD.step()
+                    self.optimD.zero_grad()
+    
+            # ======================
+            # GENERATOR
+            # ======================
+            flow_loss = self.flow_comp_loss(pred_flows, gt_local_frames)
+            flow_loss = flow_loss * self.config['losses']['flow_weight']
+    
+            gen_loss = flow_loss
+    
+            if not self.config['model']['no_dis']:
+                gen_clip = self.netD(comp_imgs)
+                gan_loss = self.adversarial_loss(gen_clip, True, False)
+                gan_loss = gan_loss * self.config['losses']['adversarial_weight']
+                gen_loss += gan_loss
+            else:
+                gan_loss = 0
+    
+            # hole loss
+            hole_loss = self.l1_loss(pred_imgs * masks, frames * masks)
+            hole_loss = hole_loss / torch.mean(masks) \
+                * self.config['losses']['hole_weight']
+            gen_loss += hole_loss
+    
+            # valid loss
+            valid_loss = self.l1_loss(pred_imgs * (1 - masks),
+                                     frames * (1 - masks))
+            valid_loss = valid_loss / torch.mean(1 - masks) \
+                * self.config['losses']['valid_weight']
+            gen_loss += valid_loss
+    
+            # 🔥 scale generator loss
+            gen_loss = gen_loss / accum_steps
+    
+            gen_loss.backward()
+    
+            if self.iteration % accum_steps == 0:
+                self.optimG.step()
+                self.optimG.zero_grad()
+    
+            self.update_learning_rate()
+    
+            # ======================
+            # LOGGING (use real values)
+            # ======================
+            if self.config['global_rank'] == 0:
+                pbar.update(1)
+    
+                # multiply back for readability
+                flow_val = flow_loss.item()
+                dis_val = dis_loss.item() * accum_steps if not self.config['model']['no_dis'] else 0
+                hole_val = hole_loss.item()
+                valid_val = valid_loss.item()
+    
+                if not self.config['model']['no_dis']:
+                    pbar.set_description(
+                        f"flow: {flow_val:.3f}; d: {dis_val:.3f}; "
+                        f"hole: {hole_val:.3f}; valid: {valid_val:.3f}"
+                    )
+                else:
+                    pbar.set_description(
+                        f"flow: {flow_val:.3f}; "
+                        f"hole: {hole_val:.3f}; valid: {valid_val:.3f}"
+                    )
+    
+            # saving models
+            if self.iteration % self.train_args['save_freq'] == 0:
+                self.save(int(self.iteration))
+    
+            if self.iteration > self.train_args['iterations']:
+                break
 
+    """
     def _train_epoch(self, pbar):
         """Process input and calculate loss every training epoch"""
         device = self.config['device']
@@ -397,3 +508,4 @@ class Trainer:
 
             if self.iteration > self.train_args['iterations']:
                 break
+            """
