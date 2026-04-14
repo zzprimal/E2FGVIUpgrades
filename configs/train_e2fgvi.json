@@ -25,11 +25,12 @@
         "beta1": 0,
         "beta2": 0.99,
         "lr": 1e-4,
-        "batch_size": 1,
-        "num_workers": 2,
+        "batch_size": 2,
+        "num_workers": 1,
         "log_freq": 100,
         "save_freq": 5e3,
-        "iterations": 10e3,
+        "iterations": 100e3,
+	"accum_steps": 4, 
         "scheduler": {
             "type": "MultiStepLR",
             "milestones": [
