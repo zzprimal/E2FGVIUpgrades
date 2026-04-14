@@ -120,7 +120,7 @@ methods.
    - CUDA >= 9.2
    - [mmcv-full](https://github.com/open-mmlab/mmcv#installation) (following the pipeline to install)
 
-   The above environment setup should work for training on a 40 series RTX card for training and inference, training on a 50 series card is difficult as mmcv has limited support for 50 series cards ()
+   The above environment setup should work for training on a 40 series RTX card for training and inference, training on a 50 series card is difficult as mmcv has limited support for 50 series cards
 
 ## Get Started
 ### Prepare pretrained models
