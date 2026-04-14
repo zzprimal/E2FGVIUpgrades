@@ -95,15 +95,32 @@ methods.
 2. Create Conda Environment and Install Dependencies
 
    ```bash
-   conda env create -f environment.yml
+   conda create -n e2fgvi python=3.10 -y
    conda activate e2fgvi
+   
+   python -m pip install --upgrade pip wheel
+   python -m pip install setuptools==68.2.2
+   
+   pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
+   --index-url https://download.pytorch.org/whl/cu118
+   
+   pip install mmcv==2.1.0 \
+   -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.0/index.html \
+   --no-cache-dir
+   
+   pip install numpy==1.24.4
+   
+   pip install tqdm
+   pip install tensorboard
+   
+   ulimit -n 65536
    ```
    - Python >= 3.7
    - PyTorch >= 1.5
    - CUDA >= 9.2
    - [mmcv-full](https://github.com/open-mmlab/mmcv#installation) (following the pipeline to install)
 
-   If the `environment.yml` file does not work for you, please follow [this issue](https://github.com/MCG-NKU/E2FGVI/issues/3) to solve the problem.
+   The above environment setup should work for training on a 40 series RTX card for training and inference, training on a 50 series card is difficult as mmcv has limited support for 50 series cards ()
 
 ## Get Started
 ### Prepare pretrained models
