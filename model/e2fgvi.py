@@ -183,23 +183,24 @@ class InpaintGenerator(BaseNetwork):
                                               n_vecs=n_vecs, t2t_params=t2t_params, pool_method="fc"))
         self.transformer = nn.Sequential(*blocks)
 
-        # 5. RAFT Flow Completion Initialization
-        args = argparse.Namespace(
-            small=False, 
-            mixed_precision=False, 
-            alternate_corr=False
-        )
-        self.update_spynet = RAFT(args) # Keeping the name update_spynet to minimize changes elsewhere
-
-        # 6. Weight Initialization
+        # 5. Weight Initialization
         if init_weights:
             self.init_weights()
             for m in self.modules():
                 if isinstance(m, SecondOrderDeformableAlignment):
                     m.init_offset()
-        
+            
+        # 6. RAFT Flow Completion Initialization
+        args = argparse.Namespace(
+            small=False, 
+            mixed_precision=False, 
+            alternate_corr=False
+        )
+        self.update_spynet2 = RAFT(args) # Keeping the name update_spynet to minimize changes elsewhere
+        self.update_spynet = SPyNet()
+
         # 7. Loading RAFT Sintel Weights
-        self.load_raft_weights("./release_model/raft-sintel.pth")
+        #self.load_raft_weights("./release_model/raft-sintel.pth")
 
     def load_raft_weights(self, path):
         try:
@@ -209,8 +210,8 @@ class InpaintGenerator(BaseNetwork):
             # Remove 'module.' prefix from DataParallel saving
             new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
             
-            self.update_spynet.load_state_dict(new_state_dict)
-            self.update_spynet.eval()
+            self.update_spynet2.load_state_dict(new_state_dict)
+            self.update_spynet2.eval()
             print(f"Successfully loaded RAFT weights from {path}")
         except Exception as e:
             print(f"Warning: Could not load RAFT weights from {path}. Error: {e}")
