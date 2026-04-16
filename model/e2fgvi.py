@@ -10,6 +10,9 @@ from model.modules.feat_prop import BidirectionalPropagation, SecondOrderDeforma
 from model.modules.tfocal_transformer import TemporalFocalTransformerBlock, SoftSplit, SoftComp
 from model.modules.spectral_norm import spectral_norm as _spectral_norm
 
+import argparse
+from raft.raft import RAFT
+
 
 class BaseNetwork(nn.Module):
     def __init__(self):
@@ -131,15 +134,16 @@ class deconv(nn.Module):
 
 
 class InpaintGenerator(BaseNetwork):
-    def __init__(self, init_weights=True):
+    def __init__(self, init_weights=True, raft_iters=20, raft_path='weights/raft-sintel.pth'):
         super(InpaintGenerator, self).__init__()
         channel = 256
         hidden = 512
+        self.raft_iters = raft_iters
 
-        # encoder
+        # 1. Encoder Initialization
         self.encoder = Encoder()
 
-        # decoder
+        # 2. Decoder Initialization
         self.decoder = nn.Sequential(
             deconv(channel // 2, 128, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
@@ -149,10 +153,10 @@ class InpaintGenerator(BaseNetwork):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1))
 
-        # feature propagation module
+        # 3. Feature Propagation Module
         self.feat_prop_module = BidirectionalPropagation(channel // 2)
 
-        # soft split and soft composition
+        # 4. Soft Split / Composition and Transformer setup
         kernel_size = (7, 7)
         padding = (3, 3)
         stride = (3, 3)
@@ -163,103 +167,110 @@ class InpaintGenerator(BaseNetwork):
             'padding': padding,
             'output_size': output_size
         }
-        self.ss = SoftSplit(channel // 2,
-                            hidden,
-                            kernel_size,
-                            stride,
-                            padding,
-                            t2t_param=t2t_params)
-        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size,
-                           stride, padding)
+        self.ss = SoftSplit(channel // 2, hidden, kernel_size, stride, padding, t2t_param=t2t_params)
+        self.sc = SoftComp(channel // 2, hidden, output_size, kernel_size, stride, padding)
 
         n_vecs = 1
         for i, d in enumerate(kernel_size):
-            n_vecs *= int((output_size[i] + 2 * padding[i] -
-                           (d - 1) - 1) / stride[i] + 1)
+            n_vecs *= int((output_size[i] + 2 * padding[i] - (d - 1) - 1) / stride[i] + 1)
 
         blocks = []
         depths = 8
-        num_heads = [4] * depths
-        window_size = [(5, 9)] * depths
-        focal_windows = [(5, 9)] * depths
-        focal_levels = [2] * depths
-        pool_method = "fc"
-
         for i in range(depths):
             blocks.append(
-                TemporalFocalTransformerBlock(dim=hidden,
-                                              num_heads=num_heads[i],
-                                              window_size=window_size[i],
-                                              focal_level=focal_levels[i],
-                                              focal_window=focal_windows[i],
-                                              n_vecs=n_vecs,
-                                              t2t_params=t2t_params,
-                                              pool_method=pool_method))
+                TemporalFocalTransformerBlock(dim=hidden, num_heads=4, window_size=(5, 9), 
+                                              focal_level=2, focal_window=(5, 9), 
+                                              n_vecs=n_vecs, t2t_params=t2t_params, pool_method="fc"))
         self.transformer = nn.Sequential(*blocks)
 
+        # 5. RAFT Flow Completion Initialization
+        args = argparse.Namespace(
+            small=False, 
+            mixed_precision=False, 
+            alternate_corr=False
+        )
+        self.update_spynet = RAFT(args) # Keeping the name update_spynet to minimize changes elsewhere
+
+        # 6. Weight Initialization
         if init_weights:
             self.init_weights()
-            # Need to initial the weights of MSDeformAttn specifically
             for m in self.modules():
                 if isinstance(m, SecondOrderDeformableAlignment):
                     m.init_offset()
+        
+        # 7. Loading RAFT Sintel Weights
+        self.load_raft_weights("./release_model/raft-sintel.pth")
 
-        # flow completion network
-        self.update_spynet = SPyNet()
+    def load_raft_weights(self, path):
+        try:
+            checkpoint = torch.load(path, map_location='cpu')
+            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+            
+            # Remove 'module.' prefix from DataParallel saving
+            new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
+            
+            self.update_spynet.load_state_dict(new_state_dict)
+            self.update_spynet.eval()
+            print(f"Successfully loaded RAFT weights from {path}")
+        except Exception as e:
+            print(f"Warning: Could not load RAFT weights from {path}. Error: {e}")
 
     def forward_bidirect_flow(self, masked_local_frames):
         b, l_t, c, h, w = masked_local_frames.size()
 
-        # compute forward and backward flows of masked frames
-        masked_local_frames = F.interpolate(masked_local_frames.view(
-            -1, c, h, w),
-                                            scale_factor=1 / 4,
-                                            mode='bilinear',
-                                            align_corners=True,
-                                            recompute_scale_factor=True)
-        masked_local_frames = masked_local_frames.view(b, l_t, c, h // 4,
-                                                       w // 4)
-        mlf_1 = masked_local_frames[:, :-1, :, :, :].reshape(
-            -1, c, h // 4, w // 4)
-        mlf_2 = masked_local_frames[:, 1:, :, :, :].reshape(
-            -1, c, h // 4, w // 4)
-        pred_flows_forward = self.update_spynet(mlf_1, mlf_2)
-        pred_flows_backward = self.update_spynet(mlf_2, mlf_1)
+        # RAFT requirements: Downsample to 1/4 (per paper) and ensure multiple of 8
+        h_down, w_down = h // 4, w // 4
+        pad_h = (8 - h_down % 8) % 8
+        pad_w = (8 - w_down % 8) % 8
 
-        pred_flows_forward = pred_flows_forward.view(b, l_t - 1, 2, h // 4,
-                                                     w // 4)
-        pred_flows_backward = pred_flows_backward.view(b, l_t - 1, 2, h // 4,
-                                                       w // 4)
+        frames = F.interpolate(masked_local_frames.view(-1, c, h, w), 
+                               size=(h_down, w_down), mode='bilinear', align_corners=True)
+        
+        if pad_h > 0 or pad_w > 0:
+            frames = F.pad(frames, (0, pad_w, 0, pad_h))
 
-        return pred_flows_forward, pred_flows_backward
+        frames = frames.view(b, l_t, c, h_down + pad_h, w_down + pad_w)
+        f1 = frames[:, :-1, ...].reshape(-1, c, h_down + pad_h, w_down + pad_w)
+        f2 = frames[:, 1:, ...].reshape(-1, c, h_down + pad_h, w_down + pad_w)
+
+        # Inference
+        _, flow_fwd = self.update_spynet(f1, f2, iters=self.raft_iters, test_mode=True)
+        _, flow_bwd = self.update_spynet(f2, f1, iters=self.raft_iters, test_mode=True)
+
+        # Unpad
+        if pad_h > 0 or pad_w > 0:
+            flow_fwd = flow_fwd[:, :, :h_down, :w_down]
+            flow_bwd = flow_bwd[:, :, :h_down, :w_down]
+
+        return (flow_fwd.view(b, l_t - 1, 2, h_down, w_down), 
+                flow_bwd.view(b, l_t - 1, 2, h_down, w_down))
 
     def forward(self, masked_frames, num_local_frames):
         l_t = num_local_frames
         b, t, ori_c, ori_h, ori_w = masked_frames.size()
 
-        # normalization before feeding into the flow completion module
+        # 1. Flow Completion
         masked_local_frames = (masked_frames[:, :l_t, ...] + 1) / 2
         pred_flows = self.forward_bidirect_flow(masked_local_frames)
 
-        # extracting features and performing the feature propagation on local features
+        # 2. Feature Extraction & Propagation
         enc_feat = self.encoder(masked_frames.view(b * t, ori_c, ori_h, ori_w))
         _, c, h, w = enc_feat.size()
+        
         local_feat = enc_feat.view(b, t, c, h, w)[:, :l_t, ...]
         ref_feat = enc_feat.view(b, t, c, h, w)[:, l_t:, ...]
-        local_feat = self.feat_prop_module(local_feat, pred_flows[0],
-                                           pred_flows[1])
+        
+        local_feat = self.feat_prop_module(local_feat, pred_flows[0], pred_flows[1])
         enc_feat = torch.cat((local_feat, ref_feat), dim=1)
 
-        # content hallucination through stacking multiple temporal focal transformer blocks
+        # 3. Content Hallucination (Transformer)
         trans_feat = self.ss(enc_feat.view(-1, c, h, w), b)
         trans_feat = self.transformer(trans_feat)
         trans_feat = self.sc(trans_feat, t)
-        trans_feat = trans_feat.view(b, t, -1, h, w)
-        enc_feat = enc_feat + trans_feat
+        enc_feat = enc_feat + trans_feat.view(b, t, -1, h, w)
 
-        # decode frames from features
-        output = self.decoder(enc_feat.view(b * t, c, h, w))
-        output = torch.tanh(output)
+        # 4. Decoding
+        output = torch.tanh(self.decoder(enc_feat.view(b * t, c, h, w)))
         return output, pred_flows
 
 
