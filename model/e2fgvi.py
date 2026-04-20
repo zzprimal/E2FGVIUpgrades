@@ -70,7 +70,7 @@ class BaseNetwork(nn.Module):
             if hasattr(m, 'init_weights'):
                 m.init_weights(init_type, gain)
 
-
+"""
 class Encoder(nn.Module):
     def __init__(self):
         super(Encoder, self).__init__()
@@ -110,7 +110,63 @@ class Encoder(nn.Module):
                 out = torch.cat([x, o], 2).view(bt, -1, h, w)
             out = layer(out)
         return out
+"""
 
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+        self.group = [1, 2, 4, 8, 1]
+        self.layers = nn.ModuleList([
+            nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),  # Layer 0: Stride 2 (1/2 res)
+            nn.LeakyReLU(0.2, inplace=True),                      # Layer 1
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # Layer 4: Stride 4 (1/4 res)
+            nn.LeakyReLU(0.2, inplace=True),                      # Layer 5
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 384, kernel_size=3, stride=1, padding=1, groups=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(640, 512, kernel_size=3, stride=1, padding=1, groups=2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(768, 384, kernel_size=3, stride=1, padding=1, groups=4),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(640, 256, kernel_size=3, stride=1, padding=1, groups=8),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 128, kernel_size=3, stride=1, padding=1, groups=1),
+            nn.LeakyReLU(0.2, inplace=True)
+        ])
+    def forward(self, x):
+        bt, c, h_in, w_in = x.size()
+        # The internal logic uses 1/4 resolution for the grouping layers
+        h, w = h_in // 4, w_in // 4
+        out = x
+        skips = {}
+        
+        for i, layer in enumerate(self.layers):
+            # 1. Handle Skip Connections
+            if i == 1: # After first Conv + LeakyReLU (1/2 res)
+                skips['s2'] = out
+            if i == 5: # After second stride-2 Conv + LeakyReLU (1/4 res)
+                skips['s4'] = out
+
+            # 2. Handle the Grouped Concatenation Logic (Original E2FGVI logic)
+            if i == 8:
+                x0 = out
+            
+            # The original logic requires concatenation BEFORE layers 10, 12, 14, 16
+            if i > 8 and i % 2 == 0:
+                g = self.group[(i - 8) // 2]
+                # x0 is the 'anchor' feature from layer 8
+                x_res = x0.view(bt, g, -1, h, w)
+                o_res = out.view(bt, g, -1, h, w)
+                # This cat operation increases channels (e.g., 384 -> 640)
+                out = torch.cat([x_res, o_res], 2).view(bt, -1, h, w)
+
+            # 3. Apply the Layer
+            out = layer(out)
+                
+        return out, skips
 
 class deconv(nn.Module):
     def __init__(self,
@@ -132,6 +188,34 @@ class deconv(nn.Module):
                           align_corners=True)
         return self.conv(x)
 
+class MultiScaleDecoder(nn.Module):
+    def __init__(self):
+        super(MultiScaleDecoder, self).__init__()
+        # Input to first deconv: 128 (hallucinated) + 128 (s4 skip) = 256
+        self.deconv1 = deconv(256, 128, kernel_size=3, padding=1)
+        self.leaky1 = nn.LeakyReLU(0.2, inplace=True)
+
+        # After deconv1: 128. Input to next conv: 128 + 64 (s2 skip) = 192
+        self.conv1 = nn.Conv2d(192, 64, kernel_size=3, stride=1, padding=1)
+        self.leaky2 = nn.LeakyReLU(0.2, inplace=True)
+
+        self.deconv2 = deconv(64, 64, kernel_size=3, padding=1)
+        self.leaky3 = nn.LeakyReLU(0.2, inplace=True)
+        self.conv_out = nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x, skips):
+        # x is the output from the hallucination stage (1/4 res)
+        # s4 is 1/4 res, s2 is 1/2 res
+
+        x = torch.cat([x, skips['s4']], dim=1) # Channel: 128 + 128
+        x = self.leaky1(self.deconv1(x))       # Upsample to 1/2 res
+
+        x = torch.cat([x, skips['s2']], dim=1) # Channel: 128 + 64
+        x = self.leaky2(self.conv1(x))
+
+        x = self.leaky3(self.deconv2(x))       # Upsample to full res
+        x = self.conv_out(x)
+        return x
 
 class InpaintGenerator(BaseNetwork):
     def __init__(self, init_weights=True, raft_iters=20, raft_path='weights/raft-sintel.pth'):
@@ -144,14 +228,8 @@ class InpaintGenerator(BaseNetwork):
         self.encoder = Encoder()
 
         # 2. Decoder Initialization
-        self.decoder = nn.Sequential(
-            deconv(channel // 2, 128, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            deconv(64, 64, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1))
+        self.decoder = MultiScaleDecoder()
+
 
         # 3. Feature Propagation Module
         self.feat_prop_module = BidirectionalPropagation(channel // 2)
@@ -196,11 +274,11 @@ class InpaintGenerator(BaseNetwork):
             mixed_precision=False, 
             alternate_corr=False
         )
-        self.update_spynet2 = RAFT(args) # Keeping the name update_spynet to minimize changes elsewhere
-        self.update_spynet = SPyNet()
+        self.update_spynet = RAFT(args) # Keeping the name update_spynet to minimize changes elsewhere
+        #self.update_spynet = SPyNet()
 
         # 7. Loading RAFT Sintel Weights
-        #self.load_raft_weights("./release_model/raft-sintel.pth")
+        self.load_raft_weights("./release_model/raft-sintel.pth")
 
     def load_raft_weights(self, path):
         try:
@@ -210,8 +288,8 @@ class InpaintGenerator(BaseNetwork):
             # Remove 'module.' prefix from DataParallel saving
             new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
             
-            self.update_spynet2.load_state_dict(new_state_dict)
-            self.update_spynet2.eval()
+            self.update_spynet.load_state_dict(new_state_dict)
+            self.update_spynet.eval()
             print(f"Successfully loaded RAFT weights from {path}")
         except Exception as e:
             print(f"Warning: Could not load RAFT weights from {path}. Error: {e}")
@@ -221,8 +299,8 @@ class InpaintGenerator(BaseNetwork):
 
         # RAFT requirements: Downsample to 1/4 (per paper) and ensure multiple of 8
         h_down, w_down = h // 4, w // 4
-        pad_h = (8 - h_down % 8) % 8
-        pad_w = (8 - w_down % 8) % 8
+        pad_h = (128 - h_down % 128) % 128
+        pad_w = (128 - w_down % 128) % 128
 
         frames = F.interpolate(masked_local_frames.view(-1, c, h, w), 
                                size=(h_down, w_down), mode='bilinear', align_corners=True)
@@ -255,7 +333,7 @@ class InpaintGenerator(BaseNetwork):
         pred_flows = self.forward_bidirect_flow(masked_local_frames)
 
         # 2. Feature Extraction & Propagation
-        enc_feat = self.encoder(masked_frames.view(b * t, ori_c, ori_h, ori_w))
+        enc_feat, skips = self.encoder(masked_frames.view(b * t, ori_c, ori_h, ori_w))
         _, c, h, w = enc_feat.size()
         
         local_feat = enc_feat.view(b, t, c, h, w)[:, :l_t, ...]
@@ -271,7 +349,7 @@ class InpaintGenerator(BaseNetwork):
         enc_feat = enc_feat + trans_feat.view(b, t, -1, h, w)
 
         # 4. Decoding
-        output = torch.tanh(self.decoder(enc_feat.view(b * t, c, h, w)))
+        output = torch.tanh(self.decoder(enc_feat.view(b * t, c, h, w), skips))
         return output, pred_flows
 
 
