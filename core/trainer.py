@@ -15,6 +15,7 @@ from core.lr_scheduler import MultiStepRestartLR, CosineAnnealingRestartLR
 from core.loss import AdversarialLoss
 from core.dataset import TrainDataset
 from model.modules.flow_comp import FlowCompletionLoss
+from raft.flow_loss import RAFTFlowCompletionLoss
 
 
 class Trainer:
@@ -49,11 +50,13 @@ class Trainer:
             type=self.config['losses']['GAN_LOSS'])
         self.adversarial_loss = self.adversarial_loss.to(self.config['device'])
         self.l1_loss = nn.L1Loss()
-        self.flow_comp_loss = FlowCompletionLoss().to(self.config['device'])
 
         # setup models including generator and discriminator
         net = importlib.import_module('model.' + config['model']['net'])
         self.netG = net.InpaintGenerator()
+
+        self.flow_comp_loss = RAFTFlowCompletionLoss(self.netG.update_spynet).to(self.config['device'])
+
         print(self.netG)
         self.netG = self.netG.to(self.config['device'])
         if not self.config['model']['no_dis']:
