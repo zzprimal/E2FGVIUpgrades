@@ -113,6 +113,7 @@ methods.
    pip install tqdm
    pip install tensorboard
    pip install scipy
+   pip install scikit-image
    
    ulimit -n 65536
    ```
