@@ -112,6 +112,7 @@ methods.
    
    pip install tqdm
    pip install tensorboard
+   pip install scipy
    
    ulimit -n 65536
    ```
